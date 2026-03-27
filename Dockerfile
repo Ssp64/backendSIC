@@ -37,12 +37,7 @@ COPY app/ ./app/
 
 # Pre-download InsightFace models during build (avoids cold-start delay at runtime)
 # The models are ~300MB total and cached at ~/.insightface/models/
-RUN python -c "
-from insightface.app import FaceAnalysis
-app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=-1, det_size=(640, 640))
-print('Models downloaded and cached.')
-"
+RUN python -c "from insightface.app import FaceAnalysis; app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); app.prepare(ctx_id=-1, det_size=(640, 640)); print('Models ready.')"
 
 # Non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
