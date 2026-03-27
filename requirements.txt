@@ -1,0 +1,31 @@
+# Memoire AI Backend — Python dependencies
+# Pin versions for reproducible builds
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.111.1
+uvicorn[standard]==0.30.1          # ASGI server with HTTP/2, websocket support
+pydantic==2.7.4
+pydantic-settings==2.3.4
+
+# ── Face AI ───────────────────────────────────────────────────────────────────
+insightface==0.7.3                 # InsightFace + ArcFace + RetinaFace
+onnxruntime==1.18.1                # CPU inference (swap for onnxruntime-gpu for CUDA)
+opencv-python-headless==4.10.0.82  # Image processing (headless = no Qt/GUI)
+Pillow==10.3.0                     # Image decode/encode
+
+# ── Clustering ────────────────────────────────────────────────────────────────
+scikit-learn==1.5.1                # DBSCAN
+numpy==1.26.4                      # Array ops
+
+# ── HTTP client (async Supabase calls) ────────────────────────────────────────
+httpx==0.27.0
+
+# ── Optional: Redis caching ───────────────────────────────────────────────────
+# redis==5.0.6
+# hiredis==2.3.2
+
+# ── Dev / testing ─────────────────────────────────────────────────────────────
+pytest==8.2.2
+pytest-asyncio==0.23.7
+httpx==0.27.0                      # Also used for TestClient
+python-multipart==0.0.9            # For file upload endpoints
