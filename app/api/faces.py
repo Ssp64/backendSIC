@@ -129,7 +129,7 @@ async def batch_index(req: BatchIndexRequest) -> BatchIndexResponse:
                     image_bytes, item.url
                 )
                 save_tasks.append(
-                    supabase_service.save_face_embeddings(item.media_id, face_results)
+                    await supabase_service.save_face_embeddings(item.media_id, face_results)
                 )
                 results.append(
                     IndexImageResponse(
