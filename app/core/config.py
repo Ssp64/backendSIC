@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # Detection thresholds
     DETECTION_THRESHOLD: float = 0.30   # face detection confidence (0-1)
     MATCHING_THRESHOLD: float = 0.50    # ArcFace cosine distance (lower = stricter)
-    CLUSTER_EPSILON: float = 0.50       # DBSCAN initial pass — kept tight; merge pass handles re-joining
+    CLUSTER_EPSILON: float = 0.68       # DBSCAN initial pass — kept tight; merge pass handles re-joining
     CLUSTER_MIN_SAMPLES: int = 1        # min faces per cluster (1 = include singletons)
 
     # Performance
