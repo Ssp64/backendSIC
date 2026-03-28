@@ -461,7 +461,44 @@ class FaceEngine:
                 if merged:
                     break
 
-        # ── 5. Sort and build output ──────────────────────────────────────────
+        # ── 5. Enforce: each face belongs to exactly one cluster ─────────────
+        # A photo with N faces can appear in up to N folders (one per face).
+        # But a photo with 1 face must appear in exactly 1 folder.
+        # After merging, check every photo — if it appears in multiple clusters,
+        # keep it only in the cluster whose centroid is closest to that photo's face.
+
+        # Build map: media_id → list of (cluster_key, best_dist_to_centroid)
+        photo_cluster_dist: dict = {}  # media_id → {cluster_key: min_dist}
+        for key, cl in cluster_map.items():
+            cent = _centroid(cl["embeddings"])
+            for r in face_records:
+                if r["media_id"] in cl["photo_ids"]:
+                    dist = float(1.0 - np.dot(r["embedding"], cent))
+                    if r["media_id"] not in photo_cluster_dist:
+                        photo_cluster_dist[r["media_id"]] = {}
+                    existing = photo_cluster_dist[r["media_id"]].get(key, float("inf"))
+                    photo_cluster_dist[r["media_id"]][key] = min(existing, dist)
+
+        # Count how many faces each photo has
+        photo_face_count: dict = {}
+        for r in face_records:
+            photo_face_count[r["media_id"]] = photo_face_count.get(r["media_id"], 0) + 1
+
+        # For photos with only 1 face, remove from all but the closest cluster
+        for media_id, cluster_dists in photo_cluster_dist.items():
+            if photo_face_count.get(media_id, 1) > 1:
+                continue  # multi-face photo — allowed in multiple folders
+            if len(cluster_dists) <= 1:
+                continue  # already in only one cluster
+            best_key = min(cluster_dists, key=cluster_dists.get)
+            for key in list(cluster_dists.keys()):
+                if key != best_key and key in cluster_map:
+                    cluster_map[key]["photo_ids"].discard(media_id)
+
+        # Remove any clusters that became empty after deduplication
+        cluster_map = {k: v for k, v in cluster_map.items() if v["photo_ids"]}
+
+        # ── 6. Sort and build output ──────────────────────────────────────────
         sorted_clusters = sorted(
             cluster_map.values(),
             key=lambda c: len(c["photo_ids"]),
