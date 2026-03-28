@@ -167,29 +167,6 @@ class FaceEngine:
         arr = np.array(img)
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-    @staticmethod
-    def _is_grayscale(bgr: np.ndarray, threshold: float = 8.0) -> bool:
-        """Return True if the image is effectively grayscale (B&W photo)."""
-        b, g, r = cv2.split(bgr)
-        diff_rg = np.mean(np.abs(r.astype(np.float32) - g.astype(np.float32)))
-        diff_rb = np.mean(np.abs(r.astype(np.float32) - b.astype(np.float32)))
-        return diff_rg < threshold and diff_rb < threshold
-
-    @staticmethod
-    def _pseudo_colorize(bgr: np.ndarray) -> np.ndarray:
-        """
-        Convert a grayscale-as-BGR image into a warm-toned pseudo-color version.
-        ArcFace was trained on color photos; giving it a plausible skin-tone tint
-        produces embeddings much closer to color photos of the same person.
-        We apply a gentle sepia-like tone which approximates typical Indian skin tones.
-        """
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        # Sepia matrix: warm brown tones
-        r = np.clip(gray.astype(np.float32) * 1.08, 0, 255).astype(np.uint8)
-        g = np.clip(gray.astype(np.float32) * 0.92, 0, 255).astype(np.uint8)
-        b = np.clip(gray.astype(np.float32) * 0.78, 0, 255).astype(np.uint8)
-        return cv2.merge([b, g, r])  # BGR order
-
     def _enhance(self, bgr: np.ndarray) -> np.ndarray:
         """
         Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to the
@@ -207,19 +184,47 @@ class FaceEngine:
         """Run RetinaFace detection with fallbacks for small/dark images."""
         faces = self._app.get(bgr)
 
-        # Fallback 1: upscale if image is small
+        # Fallback 1: upscale — helps small faces and low-res photos
         if not faces:
             h, w = bgr.shape[:2]
-            if max(h, w) < 600:
-                big = cv2.resize(bgr, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            if max(h, w) < 1000:  # upscale anything under 1000px long edge
+                scale = 1000 / max(h, w)
+                big = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
                 faces = self._app.get(big)
 
-        thresh = max(settings.DETECTION_THRESHOLD - 0.10, 0.15) if low_thresh else settings.DETECTION_THRESHOLD
+        # Fallback 2: try det_size=320 — sometimes catches faces that 640 misses
+        if not faces:
+            self._app.det_model.input_size = (320, 320)
+            try:
+                faces = self._app.get(bgr)
+            finally:
+                self._app.det_model.input_size = (640, 640)
+
+        thresh = max(settings.DETECTION_THRESHOLD - 0.10, 0.10) if low_thresh else settings.DETECTION_THRESHOLD
         return [f for f in faces if f.det_score >= thresh]
+
+    @staticmethod
+    def _is_grayscale(bgr: np.ndarray, threshold: float = 8.0) -> bool:
+        """Return True if image is effectively B&W (all channels nearly identical)."""
+        b, g, r = cv2.split(bgr)
+        diff_rg = np.mean(np.abs(r.astype(np.float32) - g.astype(np.float32)))
+        diff_rb = np.mean(np.abs(r.astype(np.float32) - b.astype(np.float32)))
+        return diff_rg < threshold and diff_rb < threshold
+
+    @staticmethod
+    def _pseudo_colorize(bgr: np.ndarray) -> np.ndarray:
+        """Apply warm sepia tone to grayscale image.
+        ArcFace was trained on color photos — giving it a skin-tone tint
+        produces embeddings much closer to color photos of the same person."""
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        r = np.clip(gray.astype(np.float32) * 1.08, 0, 255).astype(np.uint8)
+        g = np.clip(gray.astype(np.float32) * 0.92, 0, 255).astype(np.uint8)
+        b = np.clip(gray.astype(np.float32) * 0.78, 0, 255).astype(np.uint8)
+        return cv2.merge([b, g, r])
 
     def _extract_sync(self, image_bytes: bytes, url: str) -> List[dict]:
         """Full detection + embedding pipeline for one image.
-        Uses progressive fallbacks for dark/occluded/low-quality photos.
+        Uses progressive fallbacks for dark/occluded/low-quality/grayscale photos.
         """
         try:
             bgr = self._load_image(image_bytes)
@@ -227,25 +232,19 @@ class FaceEngine:
             logger.warning(f"Image decode failed ({url}): {e}")
             return []
 
-        # Detect if this is a grayscale (B&W) photo — needs special handling
-        # because ArcFace was trained on color images and produces drifted
-        # embeddings for pure grayscale input, causing clustering failures.
+        # Detect grayscale — needs colorization before ArcFace embedding
         is_gray = self._is_grayscale(bgr)
-        colorized = self._pseudo_colorize(bgr) if is_gray else None
+        primary = self._pseudo_colorize(bgr) if is_gray else bgr
 
-        # Try 1: raw image (or colorized if grayscale)
-        primary = colorized if is_gray else bgr
+        # Progressive detection fallbacks
         faces = self._detect_faces(primary)
-        # Try 2: CLAHE enhanced (helps dark photos like nighttime shots)
         if not faces:
             faces = self._detect_faces(self._enhance(primary))
-        # Try 3: strong brightness boost (very dark photos)
         if not faces:
-            faces = self._detect_faces(self._apply_brightness(primary, 1.4, 1.3))
-        # Try 4: lower detection threshold (partial/occluded faces)
+            faces = self._detect_faces(self._apply_brightness(primary, 1.5, 1.4))
         if not faces:
             faces = self._detect_faces(self._enhance(primary), low_thresh=True)
-        # Try 5: if still nothing and grayscale, try raw (non-colorized) as last resort
+        # Last resort for grayscale: try raw un-colorized
         if not faces and is_gray:
             faces = self._detect_faces(bgr)
             if not faces:
@@ -258,12 +257,11 @@ class FaceEngine:
             bbox = face.bbox.astype(int).tolist()
             pose = face.pose.tolist() if hasattr(face, "pose") and face.pose is not None else [0, 0, 0]
 
-            # For grayscale images: average embeddings across colorized + enhanced
-            # variants to produce a more color-stable embedding that clusters
-            # correctly alongside color photos of the same person.
-            if is_gray and colorized is not None:
+            # For grayscale: average embedding across multiple colorized augmentations
+            # to produce a more color-stable embedding that clusters with color photos
+            if is_gray:
                 aug_embeddings = [face.normed_embedding]
-                for aug in [self._enhance(colorized), self._apply_brightness(colorized, 1.1, 1.0)]:
+                for aug in [self._enhance(primary), self._apply_brightness(primary, 1.1, 1.0)]:
                     aug_faces = self._detect_faces(aug)
                     if aug_faces:
                         best = max(aug_faces, key=lambda f: float(f.det_score))
@@ -489,7 +487,9 @@ class FaceEngine:
         # Agglomerative is much better than DBSCAN but can still over-split when
         # the distance_threshold is conservative. This pass merges any two
         # clusters whose centroids are within MERGE_EPSILON of each other.
-        MERGE_EPSILON = min(dist_thresh * 1.25, 0.68)
+        # Fixed generous post-merge threshold — catches clusters that
+        # agglomerative missed due to lighting/pose variation.
+        MERGE_EPSILON = 0.72
 
         merged = True
         while merged:
