@@ -350,72 +350,49 @@ class FaceEngine:
         min_samples: Optional[int] = None,
     ) -> List[dict]:
         """
-        Google Photos-style person clustering using DBSCAN on ArcFace embeddings.
+        Google Photos-style person clustering using DBSCAN + centroid merge pass.
 
-        Algorithm:
-          1. Flatten all face embeddings from all photos into one array
-          2. Run DBSCAN with cosine metric (epsilon ≈ 0.45)
-          3. Each cluster = one person
-          4. Map cluster membership back to photo IDs
-          5. Sort by photo count descending
-
-        Why DBSCAN over k-means:
-          - No need to specify k (number of people) in advance
-          - Handles noise/outliers gracefully (label -1)
-          - Non-convex cluster shapes (embeddings aren't always spherical)
-          - Works at any scale: 2 people or 200
-
-        Returns sorted list of person clusters:
-            {
-                "person_id": str,         # deterministic hash of centroid
-                "label": str,             # "Person 1", "Person 2", ...
-                "photo_ids": [str, ...],  # unique photo IDs containing this person
-                "photo_count": int,
-                "face_count": int,
-                "centroid": [float, ...], # averaged embedding (for matching)
-                "representative_url": str,
-                "representative_photo_id": str,
-            }
+        Fixes over the original:
+          1. Noise points (label=-1) are re-assigned to nearest cluster instead
+             of being dumped into isolated singletons — this recovers photos
+             where the face was detected at an unusual angle or lighting.
+          2. Post-merge pass: collapses any two clusters whose centroids are
+             within MERGE_EPSILON — fixes over-splitting of the same person.
+          3. Representative photo is chosen as closest-to-centroid, not just
+             the first face seen (gives better thumbnail).
         """
-        DBSCAN, _ = _lazy_imports()[1], None
         from sklearn.cluster import DBSCAN as _DBSCAN
 
-        eps = epsilon or settings.CLUSTER_EPSILON
-        min_s = min_samples or settings.CLUSTER_MIN_SAMPLES
+        eps = epsilon if epsilon is not None else settings.CLUSTER_EPSILON
+        min_s = min_samples if min_samples is not None else settings.CLUSTER_MIN_SAMPLES
 
-        # Build flat list of (face_embedding, media_id, photo_url)
+        # ── 1. Build flat face record list ────────────────────────────────────
         face_records = []
         for item in media_items:
             embs = item.get("face_embeddings") or []
             for emb in embs:
-                face_records.append(
-                    {
-                        "embedding": np.array(emb, dtype=np.float32),
-                        "media_id": item["id"],
-                        "url": item.get("url", ""),
-                    }
-                )
+                face_records.append({
+                    "embedding": np.array(emb, dtype=np.float32),
+                    "media_id": item["id"],
+                    "url": item.get("url", ""),
+                })
 
         if not face_records:
             return []
 
-        X = np.stack([r["embedding"] for r in face_records])  # shape (N, 512)
+        X = np.stack([r["embedding"] for r in face_records])  # (N, 512)
 
-        # DBSCAN with cosine metric
-        # epsilon=0.45 means faces with cosine distance ≤ 0.45 are neighbours.
-        # This is equivalent to cosine similarity ≥ 0.55, which is conservative
-        # enough to avoid false merges while still grouping the same person across
-        # very different photos (angles, lighting, expressions).
+        # ── 2. DBSCAN first pass ──────────────────────────────────────────────
         db = _DBSCAN(eps=eps, min_samples=min_s, metric="cosine", n_jobs=-1)
         labels = db.fit_predict(X)
 
-        # Group by cluster label
-        cluster_map: dict[int, dict] = {}
+        # ── 3. Build cluster map (real clusters only first) ───────────────────
+        cluster_map: dict = {}
+        noise_indices = []
         for idx, label in enumerate(labels):
             if label == -1:
-                # DBSCAN noise — create a singleton cluster so we don't lose faces
-                label = f"noise_{idx}"
-
+                noise_indices.append(idx)
+                continue
             if label not in cluster_map:
                 cluster_map[label] = {
                     "embeddings": [],
@@ -423,42 +400,106 @@ class FaceEngine:
                     "representative_media_id": face_records[idx]["media_id"],
                     "representative_url": face_records[idx]["url"],
                 }
+            cluster_map[label]["embeddings"].append(face_records[idx]["embedding"])
+            cluster_map[label]["photo_ids"].add(face_records[idx]["media_id"])
 
-            cl = cluster_map[label]
-            cl["embeddings"].append(face_records[idx]["embedding"])
-            cl["photo_ids"].add(face_records[idx]["media_id"])
+        # ── Helper: compute normalized centroid ───────────────────────────────
+        def _centroid(embs):
+            c = np.mean(embs, axis=0)
+            n = np.linalg.norm(c)
+            return c / n if n > 0 else c
 
-        # Sort by photo count
+        # ── 4. Re-assign noise to nearest real cluster ────────────────────────
+        # Use a looser threshold than eps to give border faces a second chance.
+        noise_thresh = min(eps * 1.35, 0.68)
+
+        for idx in noise_indices:
+            emb = face_records[idx]["embedding"]
+            best_label, best_dist = None, float("inf")
+            for label, cl in cluster_map.items():
+                cent = _centroid(cl["embeddings"])
+                dist = float(1.0 - np.dot(emb, cent))
+                if dist < best_dist:
+                    best_dist, best_label = dist, label
+
+            if best_label is not None and best_dist <= noise_thresh:
+                cluster_map[best_label]["embeddings"].append(emb)
+                cluster_map[best_label]["photo_ids"].add(face_records[idx]["media_id"])
+            else:
+                # Truly isolated — keep as singleton cluster
+                key = f"singleton_{idx}"
+                cluster_map[key] = {
+                    "embeddings": [emb],
+                    "photo_ids": {face_records[idx]["media_id"]},
+                    "representative_media_id": face_records[idx]["media_id"],
+                    "representative_url": face_records[idx]["url"],
+                }
+
+        # ── 5. Post-merge: collapse over-split clusters ───────────────────────
+        # DBSCAN can create multiple small clusters for the same person when the
+        # chain of similar faces is broken (different angle, lighting).
+        # Merging pairs whose centroids are within MERGE_EPSILON fixes this.
+        MERGE_EPSILON = min(eps * 1.2, 0.62)
+
+        merged = True
+        while merged:
+            merged = False
+            keys = list(cluster_map.keys())
+            for i in range(len(keys)):
+                for j in range(i + 1, len(keys)):
+                    ka, kb = keys[i], keys[j]
+                    if ka not in cluster_map or kb not in cluster_map:
+                        continue
+                    ca = _centroid(cluster_map[ka]["embeddings"])
+                    cb = _centroid(cluster_map[kb]["embeddings"])
+                    if float(1.0 - np.dot(ca, cb)) <= MERGE_EPSILON:
+                        # Absorb kb into ka
+                        cluster_map[ka]["embeddings"].extend(cluster_map[kb]["embeddings"])
+                        cluster_map[ka]["photo_ids"].update(cluster_map[kb]["photo_ids"])
+                        del cluster_map[kb]
+                        merged = True
+                        break
+                if merged:
+                    break
+
+        # ── 6. Sort and build output ──────────────────────────────────────────
         sorted_clusters = sorted(
             cluster_map.values(),
             key=lambda c: len(c["photo_ids"]),
             reverse=True,
         )
 
-        # Build output
         people = []
         for i, cl in enumerate(sorted_clusters):
-            centroid = np.mean(cl["embeddings"], axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid = centroid / norm
+            centroid = _centroid(cl["embeddings"])
 
-            people.append(
-                {
-                    "person_index": i,
-                    "label": f"Person {i + 1}",
-                    "photo_ids": sorted(cl["photo_ids"]),
-                    "photo_count": len(cl["photo_ids"]),
-                    "face_count": len(cl["embeddings"]),
-                    "centroid": centroid.tolist(),
-                    "representative_url": cl["representative_url"],
-                    "representative_photo_id": cl["representative_media_id"],
-                }
+            # Best representative = embedding closest to centroid
+            best_k = min(
+                range(len(cl["embeddings"])),
+                key=lambda k: float(1.0 - np.dot(cl["embeddings"][k], centroid)),
             )
+            rep_emb = cl["embeddings"][best_k]
+            rep_record = next(
+                (r for r in face_records if np.array_equal(r["embedding"], rep_emb)),
+                None,
+            )
+            rep_url = rep_record["url"] if rep_record else cl.get("representative_url", "")
+            rep_id  = rep_record["media_id"] if rep_record else cl.get("representative_media_id", "")
+
+            people.append({
+                "person_index": i,
+                "label": f"Person {i + 1}",
+                "photo_ids": sorted(cl["photo_ids"]),
+                "photo_count": len(cl["photo_ids"]),
+                "face_count": len(cl["embeddings"]),
+                "centroid": centroid.tolist(),
+                "representative_url": rep_url,
+                "representative_photo_id": rep_id,
+            })
 
         logger.info(
             f"Clustering: {len(face_records)} faces → {len(people)} people "
-            f"(eps={eps}, min_samples={min_s})"
+            f"(eps={eps}, merge_eps={MERGE_EPSILON:.3f}, min_samples={min_s})"
         )
         return people
 
