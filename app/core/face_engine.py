@@ -136,36 +136,36 @@ class FaceEngine:
 
     # ─── Sync implementations (run in thread pool) ────────────────────────────
 
-   def _load_image(self, image_bytes: bytes) -> np.ndarray:
-    """Decode bytes → BGR numpy array, auto-rotating via EXIF, resizing large images."""
-    img = Image.open(io.BytesIO(image_bytes))
+    def _load_image(self, image_bytes: bytes) -> np.ndarray:
+        """Decode bytes → BGR numpy array, resizing large images."""
+        img = Image.open(io.BytesIO(image_bytes))
 
-    # Auto-rotate based on EXIF orientation tag
-    try:
-        exif = img._getexif()
-        if exif:
-            for tag, value in exif.items():
+        # Auto-rotate based on EXIF orientation tag
+        try:
+            exif = img._getexif()
+            if exif:
                 from PIL import ExifTags
-                if ExifTags.TAGS.get(tag) == 'Orientation':
-                    if value == 3:
-                        img = img.rotate(180, expand=True)
-                    elif value == 6:
-                        img = img.rotate(270, expand=True)
-                    elif value == 8:
-                        img = img.rotate(90, expand=True)
-                    break
-    except Exception:
-        pass
+                for tag, value in exif.items():
+                    if ExifTags.TAGS.get(tag) == "Orientation":
+                        if value == 3:
+                            img = img.rotate(180, expand=True)
+                        elif value == 6:
+                            img = img.rotate(270, expand=True)
+                        elif value == 8:
+                            img = img.rotate(90, expand=True)
+                        break
+        except Exception:
+            pass
 
-    img = img.convert("RGB")
-    w, h = img.size
-    max_dim = settings.MAX_IMAGE_DIM
-    if max(w, h) > max_dim:
-        scale = max_dim / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        img = img.convert("RGB")
+        w, h = img.size
+        max_dim = settings.MAX_IMAGE_DIM
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    arr = np.array(img)
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        arr = np.array(img)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
     def _enhance(self, bgr: np.ndarray) -> np.ndarray:
         """
