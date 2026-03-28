@@ -15,11 +15,6 @@ class Settings(BaseSettings):
     # A shared secret that your frontend sends in the Authorization header.
     # Generate: python -c "import secrets; print(secrets.token_hex(32))"
     API_SECRET_KEY: str = "change-me-in-production"
-    ALLOWED_ORIGINS: List[str] = [
-        "https://ssp64.github.io",
-        "https://ssp64.github.io/memoire-app",
-        "http://localhost:3000",
-    ]
 
     # ── Supabase (server-side) ────────────────────────────────────────────────
     # Use the SERVICE ROLE key here — never expose it to the frontend.
