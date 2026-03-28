@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     # Generate: python -c "import secrets; print(secrets.token_hex(32))"
     API_SECRET_KEY: str = "change-me-in-production"
     ALLOWED_ORIGINS: List[str] = [
+        "https://ssp64.github.io",
+        "https://ssp64.github.io/memoire-app",
         "http://localhost:3000",
-        "http://localhost:5173",
-        "https://your-memoire-app.vercel.app",  # replace with your domain
     ]
 
     # ── Supabase (server-side) ────────────────────────────────────────────────
@@ -29,13 +29,13 @@ class Settings(BaseSettings):
     # ── Face Engine ───────────────────────────────────────────────────────────
     # Model name — buffalo_l is the best accuracy/speed trade-off
     # Options: buffalo_l (best), buffalo_m (balanced), buffalo_s (fast)
-    INSIGHTFACE_MODEL: str = "buffalo_l"
+    INSIGHTFACE_MODEL: str = "buffalo_s"
 
     # Detection thresholds
-    DETECTION_THRESHOLD: float = 0.5   # face detection confidence (0-1)
-    MATCHING_THRESHOLD: float = 0.40   # ArcFace cosine distance (lower = stricter)
-    CLUSTER_EPSILON: float = 0.45      # DBSCAN epsilon for clustering
-    CLUSTER_MIN_SAMPLES: int = 1       # min faces per cluster (1 = include singletons)
+    DETECTION_THRESHOLD: float = 0.30   # face detection confidence (0-1)
+    MATCHING_THRESHOLD: float = 0.50    # ArcFace cosine distance (lower = stricter)
+    CLUSTER_EPSILON: float = 0.45       # DBSCAN initial pass — kept tight; merge pass handles re-joining
+    CLUSTER_MIN_SAMPLES: int = 1        # min faces per cluster (1 = include singletons)
 
     # Performance
     BATCH_SIZE: int = 8                # images processed per batch
