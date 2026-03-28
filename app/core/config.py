@@ -27,9 +27,9 @@ class Settings(BaseSettings):
     INSIGHTFACE_MODEL: str = "buffalo_l"
 
     # Detection thresholds
-    DETECTION_THRESHOLD: float = 0.30   # face detection confidence (0-1)
+    DETECTION_THRESHOLD: float = 0.20   # lower = catches dark/angled/partial faces too
     MATCHING_THRESHOLD: float = 0.50    # ArcFace cosine distance (lower = stricter)
-    CLUSTER_EPSILON: float = 0.68       # DBSCAN initial pass — kept tight; merge pass handles re-joining
+    CLUSTER_EPSILON: float = 0.60       # Agglomerative distance threshold — generous for real-world photos
     CLUSTER_MIN_SAMPLES: int = 1        # min faces per cluster (1 = include singletons)
 
     # Performance
