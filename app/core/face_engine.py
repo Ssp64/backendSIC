@@ -167,6 +167,29 @@ class FaceEngine:
         arr = np.array(img)
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
+    @staticmethod
+    def _is_grayscale(bgr: np.ndarray, threshold: float = 8.0) -> bool:
+        """Return True if the image is effectively grayscale (B&W photo)."""
+        b, g, r = cv2.split(bgr)
+        diff_rg = np.mean(np.abs(r.astype(np.float32) - g.astype(np.float32)))
+        diff_rb = np.mean(np.abs(r.astype(np.float32) - b.astype(np.float32)))
+        return diff_rg < threshold and diff_rb < threshold
+
+    @staticmethod
+    def _pseudo_colorize(bgr: np.ndarray) -> np.ndarray:
+        """
+        Convert a grayscale-as-BGR image into a warm-toned pseudo-color version.
+        ArcFace was trained on color photos; giving it a plausible skin-tone tint
+        produces embeddings much closer to color photos of the same person.
+        We apply a gentle sepia-like tone which approximates typical Indian skin tones.
+        """
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        # Sepia matrix: warm brown tones
+        r = np.clip(gray.astype(np.float32) * 1.08, 0, 255).astype(np.uint8)
+        g = np.clip(gray.astype(np.float32) * 0.92, 0, 255).astype(np.uint8)
+        b = np.clip(gray.astype(np.float32) * 0.78, 0, 255).astype(np.uint8)
+        return cv2.merge([b, g, r])  # BGR order
+
     def _enhance(self, bgr: np.ndarray) -> np.ndarray:
         """
         Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to the
@@ -204,35 +227,62 @@ class FaceEngine:
             logger.warning(f"Image decode failed ({url}): {e}")
             return []
 
-        # Try 1: raw image
-        faces = self._detect_faces(bgr)
+        # Detect if this is a grayscale (B&W) photo — needs special handling
+        # because ArcFace was trained on color images and produces drifted
+        # embeddings for pure grayscale input, causing clustering failures.
+        is_gray = self._is_grayscale(bgr)
+        colorized = self._pseudo_colorize(bgr) if is_gray else None
+
+        # Try 1: raw image (or colorized if grayscale)
+        primary = colorized if is_gray else bgr
+        faces = self._detect_faces(primary)
         # Try 2: CLAHE enhanced (helps dark photos like nighttime shots)
         if not faces:
-            faces = self._detect_faces(self._enhance(bgr))
+            faces = self._detect_faces(self._enhance(primary))
         # Try 3: strong brightness boost (very dark photos)
         if not faces:
-            faces = self._detect_faces(self._apply_brightness(bgr, 1.4, 1.3))
+            faces = self._detect_faces(self._apply_brightness(primary, 1.4, 1.3))
         # Try 4: lower detection threshold (partial/occluded faces)
         if not faces:
-            faces = self._detect_faces(self._enhance(bgr), low_thresh=True)
+            faces = self._detect_faces(self._enhance(primary), low_thresh=True)
+        # Try 5: if still nothing and grayscale, try raw (non-colorized) as last resort
+        if not faces and is_gray:
+            faces = self._detect_faces(bgr)
+            if not faces:
+                faces = self._detect_faces(self._enhance(bgr), low_thresh=True)
 
         results = []
         for face in faces:
-            emb = face.normed_embedding  # already L2-normalized 512-d float32
-            if emb is None:
+            if face.normed_embedding is None:
                 continue
             bbox = face.bbox.astype(int).tolist()
             pose = face.pose.tolist() if hasattr(face, "pose") and face.pose is not None else [0, 0, 0]
-            results.append(
-                {
-                    "embedding": emb.tolist(),
-                    "bbox": bbox,
-                    "det_score": float(face.det_score),
-                    "pose": pose,
-                }
-            )
 
-        logger.debug(f"Detected {len(results)} face(s) in {url or 'image'}")
+            # For grayscale images: average embeddings across colorized + enhanced
+            # variants to produce a more color-stable embedding that clusters
+            # correctly alongside color photos of the same person.
+            if is_gray and colorized is not None:
+                aug_embeddings = [face.normed_embedding]
+                for aug in [self._enhance(colorized), self._apply_brightness(colorized, 1.1, 1.0)]:
+                    aug_faces = self._detect_faces(aug)
+                    if aug_faces:
+                        best = max(aug_faces, key=lambda f: float(f.det_score))
+                        if best.normed_embedding is not None:
+                            aug_embeddings.append(best.normed_embedding)
+                avg = np.mean(aug_embeddings, axis=0)
+                norm = np.linalg.norm(avg)
+                embedding = (avg / norm if norm > 0 else avg).tolist()
+            else:
+                embedding = face.normed_embedding.tolist()
+
+            results.append({
+                "embedding": embedding,
+                "bbox": bbox,
+                "det_score": float(face.det_score),
+                "pose": pose,
+            })
+
+        logger.debug(f"Detected {len(results)} face(s) in {url or 'image'} (grayscale={is_gray})")
         return results
 
     def _extract_probe_sync(self, image_bytes: bytes) -> Optional[List[float]]:
