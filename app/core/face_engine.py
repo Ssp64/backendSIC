@@ -180,31 +180,41 @@ class FaceEngine:
         enhanced = cv2.merge([l, a, b])
         return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
-    def _detect_faces(self, bgr: np.ndarray) -> list:
-        """Run RetinaFace detection, fall back to upscaled if tiny faces missed."""
+    def _detect_faces(self, bgr: np.ndarray, low_thresh: bool = False) -> list:
+        """Run RetinaFace detection with fallbacks for small/dark images."""
         faces = self._app.get(bgr)
 
-        # If no faces found and image is small, try 2× upscale
+        # Fallback 1: upscale if image is small
         if not faces:
             h, w = bgr.shape[:2]
-            if max(h, w) < 400:
+            if max(h, w) < 600:
                 big = cv2.resize(bgr, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
                 faces = self._app.get(big)
 
-        return [f for f in faces if f.det_score >= settings.DETECTION_THRESHOLD]
+        thresh = max(settings.DETECTION_THRESHOLD - 0.10, 0.15) if low_thresh else settings.DETECTION_THRESHOLD
+        return [f for f in faces if f.det_score >= thresh]
 
     def _extract_sync(self, image_bytes: bytes, url: str) -> List[dict]:
-        """Full detection + embedding pipeline for one image."""
+        """Full detection + embedding pipeline for one image.
+        Uses progressive fallbacks for dark/occluded/low-quality photos.
+        """
         try:
             bgr = self._load_image(image_bytes)
         except Exception as e:
             logger.warning(f"Image decode failed ({url}): {e}")
             return []
 
-        # Try raw first, then CLAHE-enhanced
+        # Try 1: raw image
         faces = self._detect_faces(bgr)
+        # Try 2: CLAHE enhanced (helps dark photos like nighttime shots)
         if not faces:
             faces = self._detect_faces(self._enhance(bgr))
+        # Try 3: strong brightness boost (very dark photos)
+        if not faces:
+            faces = self._detect_faces(self._apply_brightness(bgr, 1.4, 1.3))
+        # Try 4: lower detection threshold (partial/occluded faces)
+        if not faces:
+            faces = self._detect_faces(self._enhance(bgr), low_thresh=True)
 
         results = []
         for face in faces:
@@ -350,21 +360,33 @@ class FaceEngine:
         min_samples: Optional[int] = None,
     ) -> List[dict]:
         """
-        Google Photos-style person clustering using DBSCAN + centroid merge pass.
+        Person clustering using Agglomerative Clustering (average linkage, cosine).
 
-        Fixes over the original:
-          1. Noise points (label=-1) are re-assigned to nearest cluster instead
-             of being dumped into isolated singletons — this recovers photos
-             where the face was detected at an unusual angle or lighting.
-          2. Post-merge pass: collapses any two clusters whose centroids are
-             within MERGE_EPSILON — fixes over-splitting of the same person.
-          3. Representative photo is chosen as closest-to-centroid, not just
-             the first face seen (gives better thumbnail).
+        Why Agglomerative over DBSCAN for this problem:
+          - DBSCAN requires every face to have a tight local neighbour within eps.
+            Hard cases (dark photo, side profile, occluded face) produce embeddings
+            far from their frontal counterparts — they get labelled as noise and
+            split into separate folders.
+          - Agglomerative with average linkage merges the two closest clusters at
+            each step using the AVERAGE distance between ALL their members.
+            A side-profile photo that is individually far from frontals can still
+            be chained in if intermediate photos bridge the gap.
+          - distance_threshold controls the cut — we use a value tuned for
+            buffalo_s (less accurate model), so it's intentionally generous.
+
+        Pipeline:
+          1. Flatten all face embeddings
+          2. Agglomerative clustering with cosine + average linkage
+          3. Post-merge: collapse any two clusters whose centroids are still close
+             (catches residual over-splits)
+          4. Sort by photo count descending
         """
-        from sklearn.cluster import DBSCAN as _DBSCAN
+        from sklearn.cluster import AgglomerativeClustering
 
-        eps = epsilon if epsilon is not None else settings.CLUSTER_EPSILON
-        min_s = min_samples if min_samples is not None else settings.CLUSTER_MIN_SAMPLES
+        # distance_threshold: clusters with average cosine distance <= this are merged.
+        # buffalo_s produces noisier embeddings so we use a more generous threshold.
+        # eps param is repurposed as distance_threshold for API compatibility.
+        dist_thresh = epsilon if epsilon is not None else settings.CLUSTER_EPSILON
 
         # ── 1. Build flat face record list ────────────────────────────────────
         face_records = []
@@ -382,17 +404,27 @@ class FaceEngine:
 
         X = np.stack([r["embedding"] for r in face_records])  # (N, 512)
 
-        # ── 2. DBSCAN first pass ──────────────────────────────────────────────
-        db = _DBSCAN(eps=eps, min_samples=min_s, metric="cosine", n_jobs=-1)
-        labels = db.fit_predict(X)
+        # ── 2. Agglomerative clustering ───────────────────────────────────────
+        if len(face_records) == 1:
+            labels = np.array([0])
+        else:
+            ac = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=dist_thresh,
+                metric="cosine",
+                linkage="average",  # average linkage: robust to outlier faces
+            )
+            labels = ac.fit_predict(X)
 
-        # ── 3. Build cluster map (real clusters only first) ───────────────────
+        # ── Helper: compute normalized centroid ───────────────────────────────
+        def _centroid(embs):
+            c = np.mean(embs, axis=0)
+            n = np.linalg.norm(c)
+            return c / n if n > 0 else c
+
+        # ── 3. Build cluster map ──────────────────────────────────────────────
         cluster_map: dict = {}
-        noise_indices = []
         for idx, label in enumerate(labels):
-            if label == -1:
-                noise_indices.append(idx)
-                continue
             if label not in cluster_map:
                 cluster_map[label] = {
                     "embeddings": [],
@@ -403,43 +435,11 @@ class FaceEngine:
             cluster_map[label]["embeddings"].append(face_records[idx]["embedding"])
             cluster_map[label]["photo_ids"].add(face_records[idx]["media_id"])
 
-        # ── Helper: compute normalized centroid ───────────────────────────────
-        def _centroid(embs):
-            c = np.mean(embs, axis=0)
-            n = np.linalg.norm(c)
-            return c / n if n > 0 else c
-
-        # ── 4. Re-assign noise to nearest real cluster ────────────────────────
-        # Use a looser threshold than eps to give border faces a second chance.
-        noise_thresh = min(eps * 1.35, 0.68)
-
-        for idx in noise_indices:
-            emb = face_records[idx]["embedding"]
-            best_label, best_dist = None, float("inf")
-            for label, cl in cluster_map.items():
-                cent = _centroid(cl["embeddings"])
-                dist = float(1.0 - np.dot(emb, cent))
-                if dist < best_dist:
-                    best_dist, best_label = dist, label
-
-            if best_label is not None and best_dist <= noise_thresh:
-                cluster_map[best_label]["embeddings"].append(emb)
-                cluster_map[best_label]["photo_ids"].add(face_records[idx]["media_id"])
-            else:
-                # Truly isolated — keep as singleton cluster
-                key = f"singleton_{idx}"
-                cluster_map[key] = {
-                    "embeddings": [emb],
-                    "photo_ids": {face_records[idx]["media_id"]},
-                    "representative_media_id": face_records[idx]["media_id"],
-                    "representative_url": face_records[idx]["url"],
-                }
-
-        # ── 5. Post-merge: collapse over-split clusters ───────────────────────
-        # DBSCAN can create multiple small clusters for the same person when the
-        # chain of similar faces is broken (different angle, lighting).
-        # Merging pairs whose centroids are within MERGE_EPSILON fixes this.
-        MERGE_EPSILON = min(eps * 1.2, 0.62)
+        # ── 4. Post-merge: collapse residual over-splits ──────────────────────
+        # Agglomerative is much better than DBSCAN but can still over-split when
+        # the distance_threshold is conservative. This pass merges any two
+        # clusters whose centroids are within MERGE_EPSILON of each other.
+        MERGE_EPSILON = min(dist_thresh * 1.25, 0.68)
 
         merged = True
         while merged:
@@ -453,7 +453,6 @@ class FaceEngine:
                     ca = _centroid(cluster_map[ka]["embeddings"])
                     cb = _centroid(cluster_map[kb]["embeddings"])
                     if float(1.0 - np.dot(ca, cb)) <= MERGE_EPSILON:
-                        # Absorb kb into ka
                         cluster_map[ka]["embeddings"].extend(cluster_map[kb]["embeddings"])
                         cluster_map[ka]["photo_ids"].update(cluster_map[kb]["photo_ids"])
                         del cluster_map[kb]
@@ -462,7 +461,7 @@ class FaceEngine:
                 if merged:
                     break
 
-        # ── 6. Sort and build output ──────────────────────────────────────────
+        # ── 5. Sort and build output ──────────────────────────────────────────
         sorted_clusters = sorted(
             cluster_map.values(),
             key=lambda c: len(c["photo_ids"]),
@@ -499,7 +498,7 @@ class FaceEngine:
 
         logger.info(
             f"Clustering: {len(face_records)} faces → {len(people)} people "
-            f"(eps={eps}, merge_eps={MERGE_EPSILON:.3f}, min_samples={min_s})"
+            f"(dist_thresh={dist_thresh}, merge_eps={MERGE_EPSILON:.3f})"
         )
         return people
 
