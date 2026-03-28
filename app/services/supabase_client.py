@@ -59,19 +59,18 @@ class SupabaseServiceClient:
 
         embeddings = [r["embedding"] for r in face_results]
         payload = {
-            "face_embeddings": json.dumps(embeddings),
+            # Pass as a real Python list — httpx/json serializer will encode it
+            # as a proper JSON array, so Postgres stores it as jsonb array (not string).
+            "face_embeddings": embeddings,
             "face_count": len(embeddings),
-            # Store bboxes/scores for future use (face cropping, quality filter)
-            "face_metadata": json.dumps(
-                [
-                    {
-                        "bbox": r["bbox"],
-                        "det_score": r["det_score"],
-                        "pose": r.get("pose", [0, 0, 0]),
-                    }
-                    for r in face_results
-                ]
-            ),
+            "face_metadata": [
+                {
+                    "bbox": r["bbox"],
+                    "det_score": r["det_score"],
+                    "pose": r.get("pose", [0, 0, 0]),
+                }
+                for r in face_results
+            ],
         }
 
         resp = await self.client.patch(
