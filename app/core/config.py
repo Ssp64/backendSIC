@@ -18,14 +18,14 @@ class Settings(BaseSettings):
 
     # Face engine
     INSIGHTFACE_MODEL:    str   = "buffalo_l"   # buffalo_l = best accuracy
-    DETECTION_THRESHOLD:  float = 0.20          # lower = catches dark/angled faces
+    DETECTION_THRESHOLD:  float = 0.15          # low = catches dark/angled/small faces
     MATCHING_THRESHOLD:   float = 0.50          # cosine distance cutoff for matching
     CLUSTER_EPSILON:      float = 0.60          # agglomerative distance threshold
     CLUSTER_MIN_SAMPLES:  int   = 1
 
     # Performance
     BATCH_SIZE:       int = 8
-    MAX_IMAGE_DIM:    int = 1280
+    MAX_IMAGE_DIM:    int = 1920              # larger = better detection on hi-res photos
     MAX_FILE_SIZE_MB: int = 20
 
     class Config:
