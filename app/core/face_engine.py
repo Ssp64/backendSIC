@@ -137,20 +137,31 @@ class FaceEngine:
     # ── Detection ─────────────────────────────────────────────────────────────
 
     def _detect(self, bgr: np.ndarray, low_thresh: bool = False) -> list:
-        """Run RetinaFace with automatic upscale fallback."""
+        """Run RetinaFace with aggressive fallbacks to minimise missed faces."""
         faces = self._app.get(bgr)
 
-        # Upscale small images — helps small/distant faces
+        # Fallback 1: upscale — helps small/distant faces regardless of original size.
+        # Always try this if no faces found; a 4K photo with a small face still benefits.
         if not faces:
             h, w = bgr.shape[:2]
             long_edge = max(h, w)
-            if long_edge < 960:
-                scale = 960 / long_edge
-                big   = cv2.resize(bgr, (int(w * scale), int(h * scale)),
-                                   interpolation=cv2.INTER_CUBIC)
-                faces = self._app.get(big)
+            # Target at least 960px on long edge; for already-large images, try 1.5×
+            target = max(960, int(long_edge * 1.5))
+            scale  = target / long_edge
+            big    = cv2.resize(bgr, (int(w * scale), int(h * scale)),
+                                interpolation=cv2.INTER_CUBIC)
+            faces  = self._app.get(big)
 
-        thresh = max(settings.DETECTION_THRESHOLD - 0.10, 0.10) \
+        # Fallback 2: smaller det_size — sometimes catches faces that 640 misses
+        if not faces:
+            self._app.det_model.input_size = (320, 320)
+            try:
+                faces = self._app.get(bgr)
+            finally:
+                self._app.det_model.input_size = (640, 640)
+
+        # Apply threshold — low_thresh drops it further to catch partially-visible faces
+        thresh = max(settings.DETECTION_THRESHOLD - 0.15, 0.05) \
                  if low_thresh else settings.DETECTION_THRESHOLD
         return [f for f in faces if f.det_score >= thresh]
 
